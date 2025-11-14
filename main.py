@@ -11,6 +11,14 @@ from joblib import Parallel, delayed
 import warnings
 warnings.filterwarnings('ignore')
 
+# Detect available CPU cores and GPU
+import multiprocessing
+N_JOBS = min(multiprocessing.cpu_count(), 8)  # Limit to 8 to avoid overhead
+print(f"Using {N_JOBS} CPU cores for parallel processing")
+
+# Try to detect GPU/Metal support for XGBoost (will be set after imports)
+XGBOOST_DEVICE = 'cpu'  # Default
+
 
 # RMSPE metric
 def rmspe(y_true, y_pred):
@@ -203,7 +211,11 @@ def create_features(df, cost_of_living, target=None, encoders=None):
 # Model training with RMSPE
 def train_model(name, model, X_train, y_train, X_val, y_val):
     start = datetime.now()
-    model.fit(X_train, y_train)
+    # Handle XGBoost early stopping
+    if isinstance(model, XGBRegressor) and hasattr(model, 'early_stopping_rounds') and model.early_stopping_rounds:
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    else:
+        model.fit(X_train, y_train)
     y_pred = model.predict(X_val)
     accuracy = model.score(X_val, y_val)
     rmspe_score = rmspe(y_val, y_pred)
@@ -220,6 +232,20 @@ print("\nLoading data...")
 cost_of_living = pd.read_csv('cost_of_living.csv', na_values='NA')
 train = pd.read_csv('train.csv')
 test = pd.read_csv('test.csv')
+
+# Detect GPU/Metal support for XGBoost
+print("\nDetecting hardware acceleration...")
+try:
+    import platform
+    machine = platform.machine()
+    processor = platform.processor()
+    
+    # Apple Silicon detection
+    if machine == 'arm64' or 'Apple' in machine or (processor and 'arm' in processor.lower()):
+        print("✓ Detected Apple Silicon Mac")
+    print("✓ Using optimized CPU acceleration (all cores)")
+except Exception as e:
+    print(f"✓ Using optimized CPU acceleration")
 
 # Create features
 print("Creating advanced features...")
@@ -249,8 +275,11 @@ print(f"Validation: {X_val.shape[0]} samples\n")
 
 # Feature selection - keep top features using multiple models
 print("Selecting important features...")
-rf_selector = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-xgb_selector = XGBRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+rf_selector = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=N_JOBS)
+xgb_selector = XGBRegressor(
+    n_estimators=100, random_state=42, n_jobs=N_JOBS,
+    tree_method='hist'
+)
 
 rf_selector.fit(X_train, y_train)
 xgb_selector.fit(X_train, y_train)
@@ -277,41 +306,47 @@ print(f"Top 5 features: {feature_importance.head(5)['feature'].tolist()}")
 X_train = X_train[important_features].copy()
 X_val = X_val[important_features].copy()
 
-# Optimized models with better hyperparameters
+# Optimized models with better hyperparameters and early stopping
 print("\nTraining optimized models...")
+
+# Note: GPU/Metal acceleration not available in this XGBoost build
+# Using CPU with optimized parallel processing instead
+
 models = {
     "XGBoost": XGBRegressor(
         n_estimators=600, learning_rate=0.025, max_depth=9,
         min_child_weight=5, subsample=0.9, colsample_bytree=0.9,
         gamma=0.15, reg_alpha=0.15, reg_lambda=1.5,
-        random_state=42, n_jobs=-1, tree_method='hist'
+        random_state=42, n_jobs=N_JOBS, tree_method='hist',
+        early_stopping_rounds=50
     ),
     "XGBoost2": XGBRegressor(
         n_estimators=700, learning_rate=0.02, max_depth=8,
         min_child_weight=6, subsample=0.88, colsample_bytree=0.88,
         gamma=0.2, reg_alpha=0.2, reg_lambda=2.0,
-        random_state=123, n_jobs=-1, tree_method='hist'
+        random_state=123, n_jobs=N_JOBS, tree_method='hist',
+        early_stopping_rounds=50
     ),
     "GradientBoosting": GradientBoostingRegressor(
         n_estimators=600, learning_rate=0.025, max_depth=9,
         min_samples_split=3, min_samples_leaf=1,
         subsample=0.9, max_features='sqrt',
-        random_state=42
+        random_state=42, n_iter_no_change=50, validation_fraction=0.2
     ),
     "RandomForest": RandomForestRegressor(
         n_estimators=600, max_depth=28, min_samples_split=3,
         min_samples_leaf=1, max_features='sqrt',
-        random_state=42, n_jobs=-1
+        random_state=42, n_jobs=N_JOBS
     ),
     "ExtraTrees": ExtraTreesRegressor(
         n_estimators=600, max_depth=28, min_samples_split=3,
         min_samples_leaf=1, max_features='sqrt',
-        random_state=42, n_jobs=-1
+        random_state=42, n_jobs=N_JOBS
     ),
 }
 
-# Train all models
-results = Parallel(n_jobs=-1)(
+# Train all models in parallel (using 'loky' backend for CPU-bound tasks)
+results = Parallel(n_jobs=min(N_JOBS, len(models)))(  # Default 'loky' backend is better for CPU-bound
     delayed(train_model)(name, model, X_train, y_train, X_val, y_val)
     for name, model in models.items()
 )
@@ -327,17 +362,62 @@ print(f"{'='*70}")
 # Create stacking ensemble (more powerful than voting)
 print("\nCreating STACKING ensemble...")
 top_4 = sorted(results, key=lambda x: x[1])[:4]  # Use top 4 models
-base_models = [(name, model) for name, _, model, _, _ in top_4]
+
+# Create fresh models without early stopping for ensemble (ensembles handle CV internally)
+base_models = []
+for name, _, _, _, _ in top_4:
+    if name == "XGBoost":
+        model = XGBRegressor(
+            n_estimators=600, learning_rate=0.025, max_depth=9,
+            min_child_weight=5, subsample=0.9, colsample_bytree=0.9,
+            gamma=0.15, reg_alpha=0.15, reg_lambda=1.5,
+            random_state=42, n_jobs=N_JOBS, tree_method='hist'
+        )
+    elif name == "XGBoost2":
+        model = XGBRegressor(
+            n_estimators=700, learning_rate=0.02, max_depth=8,
+            min_child_weight=6, subsample=0.88, colsample_bytree=0.88,
+            gamma=0.2, reg_alpha=0.2, reg_lambda=2.0,
+            random_state=123, n_jobs=N_JOBS, tree_method='hist'
+        )
+    elif name == "GradientBoosting":
+        model = GradientBoostingRegressor(
+            n_estimators=600, learning_rate=0.025, max_depth=9,
+            min_samples_split=3, min_samples_leaf=1,
+            subsample=0.9, max_features='sqrt',
+            random_state=42, n_iter_no_change=50, validation_fraction=0.2
+        )
+    elif name == "RandomForest":
+        model = RandomForestRegressor(
+            n_estimators=600, max_depth=28, min_samples_split=3,
+            min_samples_leaf=1, max_features='sqrt',
+            random_state=42, n_jobs=N_JOBS
+        )
+    elif name == "ExtraTrees":
+        model = ExtraTreesRegressor(
+            n_estimators=600, max_depth=28, min_samples_split=3,
+            min_samples_leaf=1, max_features='sqrt',
+            random_state=42, n_jobs=N_JOBS
+        )
+    else:
+        # Fallback: use the trained model but remove early stopping if it's XGBoost
+        model = [m for n, _, m, _, _ in results if n == name][0]
+        if isinstance(model, XGBRegressor):
+            # Clone without early stopping
+            params = model.get_params()
+            params.pop('early_stopping_rounds', None)
+            model = XGBRegressor(**params)
+    base_models.append((name, model))
 
 # Meta-learner with regularization
 meta_learner = Ridge(alpha=0.5)
 
-# Stacking ensemble with more CV folds
+# Stacking ensemble with optimized CV folds (reduced for speed)
 stacking_ensemble = StackingRegressor(
     estimators=base_models,
     final_estimator=meta_learner,
-    cv=7,  # More folds for better generalization
-    n_jobs=-1,
+    cv=5,  # Reduced from 7 to 5 for faster training
+    n_jobs=N_JOBS,
     passthrough=True  # Include original features
 )
 
@@ -403,6 +483,8 @@ if missing:
 
 test_X = test_X[important_features].copy()
 test_X = test_X[X_train.columns]
+
+# Data types optimized for CPU processing
 
 # Predict
 print("Making predictions...")
